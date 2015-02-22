@@ -1,0 +1,155 @@
+---
+title: "Predicting Barbell Lifting Exercise Manner from Personal Activity Data"
+author: "Ilia Lvov"
+date: "Sunday, February 22, 2015"
+output: html_document
+---
+
+```{r defaults, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+## Abstract
+
+This report suggests and verifies predictive algorithms that can be used to predict the way people perform the barbell lifting exercise from personal activity data collected with devices such as Jawbone Up, Nike FuelBand, and Fitbit. The data used in this report comes from the following source: [http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har).
+
+##  1. Data structure 
+
+Train and test data are stored in respective data frames.
+
+```{r loading_data}
+train <- read.csv("pml-training.csv") # Loading train data
+test <- read.csv("pml-testing.csv") # Loading test data
+```
+
+First 7 columns of train data are various IDs (time- and participant stamps) that should not be used for the analysis. The following 152 columns are various numeric parametres of the personal activity data. The last column *classe* holds letter codes (A-E) for 5 different manners of performing the exercise. It is the response variable.
+
+Test data holds a similar structure with the exeption of the last column that is one more ID (problem ID) instead of *classe*.
+
+Hence we can create data frames with the predictors only and a vector of train responses. We can also make assure that all the predictor columns are of appropriate type (numeric).
+
+```{r separating_predictors_response, warning=FALSE}
+
+# Splitting predictors and responses
+train_predict <- train[,8:159]
+test_predict <- test[,8:159]
+train_response <- train$classe
+
+# Writing a function that turns predictors of various data types to numeric.
+predictorToNumeric <- function(predictor) {
+      if (class(predictor) == "numeric") {
+            return(predictor) # Return numeric predictor as are.
+      } else {
+            if (class(predictor) == "factor") {
+                  return(as.numeric(levels(predictor))[predictor]) # Special case of factor-to-numeric.
+            } else {
+                  return(as.numeric(predictor)) # General case of converting nonnumeric-to-numeric.
+            }
+      }
+}
+
+# Applying conversion
+train_predict <- as.data.frame(lapply(
+      train_predict,
+      predictorToNumeric))
+test_predict <- as.data.frame(lapply(
+      test_predict,
+      predictorToNumeric))
+```
+
+## 2. Data slicing
+
+Before proceeding with the analysis, we split the train data into 2 more datasets called 'training' and 'validating'. This is required to be able to perform cross-validation of the developed predicting algorithms.
+
+```{r data_slicing, message=FALSE}
+require(caret)
+set.seed(1234)
+
+# Vector of training case numbers.
+in_training <- createDataPartition(y = train_predict[,1],
+                                   p = 0.75,
+                                   list = FALSE)
+
+# Slicing.
+training_predict <- train_predict[in_training,]
+training_response <- train_response[in_training]
+validating_predict <- train_predict[-in_training,]
+validating_response <- train_response[-in_training]
+```
+
+## 3. Exploratory data analysis
+
+This section explores the data to suggest what features and models may be prioritised for the prediction algorithm building.
+
+### 3.1. Checking for NAs
+
+To make an initial selection of features it is worth checking which of them actually have many values not missed. 
+
+``` {r find_NAs}
+na_share <- sapply(training_predict, function (x) {mean(is.na(x))}) # Share of NAs for each feature
+column_has_na <- (na_share > 0)
+table(column_has_na) # How many columns have/do not have missing values.
+summary(na_share[column_has_na]) # Summary of NA shares for columns that have at least one NA.
+```
+
+As the information above suggests, the data contains many features that are nearly full of NAs, while the rest of features do not have NAs at all. So it makes sense to restrict the analysis only to the latter.
+
+```{r throwing_NAs_away}
+# Throwing away NA-rich features.
+training_predict <- training_predict[,!column_has_na]
+validating_predict <- validating_predict[,!column_has_na]
+test_predict <- test_predict[,!column_has_na]
+```
+
+### 3.2. Feature-response relationships
+
+It is worth to check if data suggests any clear relationships between potential predictors and the response. If yes, it will be sensible to use multinomial regressions, simple neural networks and other algorithms that model predictor-response relationship with monotoneous coefficients in subsequent predictions. If no, partitioning algorithms such as tree-based classifiers seem more promising.
+
+The following figure shows box-plots of randomly selected 6 predicting features by response class.
+
+```{r plotting_relationships, cache=FALSE}
+set.seed(3234)
+features_to_plot <- sample(1:ncol(training_predict), 6) # random selection of 6 features
+par(mfrow = c(2,3))
+for (i in 1:6) {
+      boxplot(training_predict[,i] ~ training_response)
+      }
+```
+
+As can be seen while some features tend to have an abnormally peaked distribution if response class is A, for the rest of the classes their distributions are pretty similar. Hence, tree-based models will be used in subsequent predictions.
+
+## 4. Model building
+
+Exploratory analysis performed above suggests to use a tree-based model for predictions. Among various types of tree models it makes sense to start with trying random forest predictions with the *randomForest* R package. First of all, random forest algorithms are generally known to be very accurate. Second, the specific algorithm used in the aforementioned R package uses **built-in cross-validation for estimating features' importance** and prioritising them. Hence, even if the prediction appears to be not very accurate, the gathered information on the variable importance can be used in other models.
+
+``` {r random_forest, results='hide', cache=TRUE}
+require(randomForest)
+set.seed(1234)
+rf_model <- randomForest(x = training_predict,
+                         y = training_response,
+                         importance = TRUE) # This enables CV-based importance calculation.
+```
+
+Now that the model is built we can assess its in-sample accuracy and examine other fit parametres with the help of confusion matrix.
+
+```{r in_sample}
+training_prediction <- predict(rf_model, training_predict) # predicting on the training set with the built model.
+confusionMatrix(training_prediction, training_response)
+```
+
+### 4.1. Cross-validation
+
+As seen above, in sample-accuracy is perfect 1! This may either mean that the built predicting algorithm is very powerful, or that it is overfitted to the noise in the training data. The latter explanation does not seem extremely plausible though, as random forest algorithm is meant to compensate for overfitting of the  simple tree algorithm. Hence, **we can expect very good out-of-sample accuracy and a respective out-of-sample error probably within 1-2%**.
+
+The suggestion above can be **tested with cross-validation**. We can use the built model to predict the outcomes on the 'validating' dataset and see what the out-of-sample error is.
+
+```{r out_of_sample}
+validating_prediction <- predict(rf_model, validating_predict) # predicting on the validating set with the built model.
+confusionMatrix(validating_prediction, validating_response)
+```
+
+As seen, the classifier performs very good on the out-of-sample data and shows the accuracy within a confidence interval of *(0.992, 0.9964)*, i.e. 99.2% minimum. Such accuracy is sufficient for the aims of this report, so no more models are needed to be built.
+
+## 5. Conclusion
+
+This report shows that the random forest algorithm implemented in the *randomForest* R-package allows to to predict the way people perform the barbell lifting exercise from personal activity data with very high out-of-sample accuracy. Moreover, in the employed data it has been sufficient to use only those features of data that do not have missing values for the prediction. It is important to note that the tuning parametre *importance* of the random forest algorithm has been turned to *TRUE*, i.e. importance of different predictors has been estimated during the model fit.
